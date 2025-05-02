@@ -1,46 +1,81 @@
 import os
 import glob
 import subprocess
+import sys
+import shutil
+from pathlib import Path
 from llama_cpp import Llama
 
 # 目錄設定
-input_dir = "input"
+input_dir = "input/test"  # 請設為你的來源資料夾
 output_dir = "output"
 os.makedirs(output_dir, exist_ok=True)
 
-# 模型路徑
+# 確認 Ghostscript 可執行檔
+GS_CMD = shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+if GS_CMD is None:
+    print("Ghostscript 可執行檔 gs/gswin64c 未找到，請安裝並加入 PATH。")
+    sys.exit(1)
+
+# 模型設定
 model_path = "./models/JSL-MedMNX-7B-SFT-Q4_K_M.gguf"
 llm = Llama(
     model_path=model_path,
     n_ctx=8192,
-    n_gpu_layers=-1,     # ✅ 將前 100 層放到 GPU，加速推理
-    use_mlock=True,       # ✅ 鎖定記憶體避免被換出（可選）
-    use_mmap=True,        # ✅ 使用 mmap 加快載入（預設為 True）
-    verbose=True          # ✅ 顯示詳細 log，幫助確認 GPU 是否啟用
+    n_gpu_layers=-1,     # 加速推理
+    use_mlock=True,      # 鎖定記憶體避免換出
+    use_mmap=True,       # mmap 加快載入
+    verbose=True         # 詳細 log
 )
 print(llm.ctx)
 print("🚀 GPU loaded successfully!")
 
 # 處理每一份 PDF
 for pdf_path in glob.glob(os.path.join(input_dir, "*.pdf")):
-    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    base_name    = os.path.splitext(os.path.basename(pdf_path))[0]
     sidecar_path = os.path.join(output_dir, base_name + ".txt")
+    temp_output  = os.path.join(output_dir, base_name + "_tmp.pdf")
+    fixed_pdf    = os.path.join(output_dir, base_name + "_fixed.pdf")
 
-    # 執行 OCRmyPDF 並產生純文字 sidecar
-    temp_output_pdf = os.path.join(output_dir, base_name + "_tmp.pdf")
-    subprocess.run([
-        "ocrmypdf",
-        "--force-ocr",
-        "--sidecar", sidecar_path,
-        pdf_path,
-        temp_output_pdf
-    ], check=True)
+    # 嘗試直接 OCR
+    try:
+        subprocess.run([
+            "ocrmypdf",
+            "--force-ocr",
+            "--sidecar", sidecar_path,
+            "--continue-on-soft-render-error",
+            pdf_path, temp_output
+        ], check=True, capture_output=True, text=True)
 
-    # 讀取 OCR 結果（限制長度）
+    except subprocess.CalledProcessError as e:
+        err = e.stderr or ""
+        if "NegativeDimensionError" in err:
+            print(f"⚠️ {base_name} 遇到 NegativeDimensionError，使用 Ghostscript 重寫 PDF …")
+            # 用 Ghostscript 重寫 PDF
+            subprocess.run([
+                GS_CMD, "-q", "-o", fixed_pdf,
+                "-sDEVICE=pdfwrite",
+                "-dSAFER", "-dNOPAUSE", "-dBATCH",
+                pdf_path
+            ], check=True)
+            # 再次執行 OCR
+            subprocess.run([
+                "ocrmypdf",
+                "--force-ocr",
+                "--sidecar", sidecar_path,
+                "--continue-on-soft-render-error",
+                fixed_pdf, temp_output
+            ], check=True)
+            os.remove(fixed_pdf)
+        else:
+            print(f"❌ {base_name} OCR 失敗：{err}")
+            continue
+
+    # 讀取 OCR 結果
     with open(sidecar_path, "r", encoding="utf-8") as f:
         ocr_text = f.read()[:8000]
 
-    # prompt 設定：要求 markdown 結構、加上標題符號
+    # 準備 prompt
     system_prompt = (
         "You are a professional medical assistant. Given an OCR-extracted pathology report, "
         "analyze and summarize the findings below in markdown format using heading syntax (###):\n\n"
@@ -51,13 +86,12 @@ for pdf_path in glob.glob(os.path.join(input_dir, "*.pdf")):
         "Rules:\n- Only output the markdown (no explanations or extra tags).\n"
         "Please begin the output with ### Histologic type:"
     )
-
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": ocr_text}
     ]
 
-    # 執行模型推論
+    # 模型推論
     response = llm.create_chat_completion(
         messages=messages,
         max_tokens=1024,
@@ -65,7 +99,7 @@ for pdf_path in glob.glob(os.path.join(input_dir, "*.pdf")):
     )
     output_text = response["choices"][0]["message"]["content"].strip()
 
-    # 儲存 Markdown 結果
+    # 儲存結果
     md_path = os.path.join(output_dir, base_name + ".md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(output_text)

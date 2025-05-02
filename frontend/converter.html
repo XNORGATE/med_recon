@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Medical Report Simplifier</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            background: #F3F4F6;
+            color: #1F2937;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: auto;
+            padding: 2rem;
+        }
+
+        .header {
+            text-align: center;
+            padding: 2rem 1rem;
+            background: linear-gradient(to right, #6366F1, #4F46E5);
+            color: white;
+            border-radius: 1rem;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            font-weight: 800;
+            margin: 0 0 0.5rem;
+        }
+
+        .header p {
+            font-weight: 400;
+            font-size: 1rem;
+        }
+
+        .dropzone {
+            border: 2px dashed #A5B4FC;
+            border-radius: 1rem;
+            padding: 2rem;
+            text-align: center;
+            background: white;
+            margin-top: 2rem;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        .dropzone:hover {
+            background: #EEF2FF;
+        }
+
+        .progress-wrapper {
+            margin-top: 1rem;
+            background: #E5E7EB;
+            border-radius: 1rem;
+            overflow: hidden;
+            display: none;
+            /* 加這行：初始隱藏 */
+        }
+
+
+        .progress-bar {
+            height: 12px;
+            width: 0%;
+            background: #4F46E5;
+            transition: width 0.3s ease-in-out;
+        }
+
+        .file-info {
+            margin-top: 1rem;
+            background: #F9FAFB;
+            padding: 1rem;
+            border-radius: 0.75rem;
+            font-size: 0.9rem;
+            color: #374151;
+        }
+
+        .button {
+            background: #6366F1;
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .button:hover {
+            background: #4F46E5;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Medical Report Simplifier</h1>
+            <p>Upload pathology reports and get structured summaries instantly</p>
+        </div>
+
+        <div style="margin:1rem 0">
+            <label><input type="radio" name="modelSel" value="old" checked> 舊模型</label>
+            <label style="margin-left:1rem"><input type="radio" name="modelSel" value="new"> 新模型</label>
+            <label style="margin-left:1rem"><input type="radio" name="modelSel" value="mixed"> 混合</label>
+        </div>
+
+        <div class="dropzone" id="dropzone">
+            <p>Click or drop PDFs here to upload and convert</p>
+        </div>
+        <div class="progress-wrapper">
+            <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="file-info" id="fileInfo" style="display:none;"></div>
+        <div id="resultsContainer" style="margin-top:2rem;"></div>
+    </div>
+
+    <script>
+        // 你的 JS 裡直接寫：
+        const API_BASE = 'https://medrecon.xnor-development.com';
+
+        const dropzone = document.getElementById('dropzone');
+        const progressBar = document.getElementById('progressBar');
+        const fileInfo = document.getElementById('fileInfo');
+        const resultsContainer = document.getElementById('resultsContainer');
+
+
+
+
+        // Add toggle switch UI to control merge mode
+        const mergeToggle = document.createElement('label');
+        mergeToggle.style.display = 'flex';
+        mergeToggle.style.alignItems = 'center';
+        mergeToggle.style.gap = '0.5rem';
+        mergeToggle.style.margin = '1rem 0';
+
+        mergeToggle.innerHTML = `
+  <input type="checkbox" id="mergeModeToggle" />
+  <span>Merge all uploads into a single report</span>
+`;
+
+        document.querySelector('.container').insertBefore(mergeToggle, document.getElementById('dropzone'));
+
+        let mergeMode = false;
+        const toggleElement = document.getElementById('mergeModeToggle');
+        toggleElement.addEventListener('change', () => {
+            mergeMode = toggleElement.checked;
+            console.log('🪄 Merge mode:', mergeMode);
+        });
+
+        // updated to support image and PDF upload
+        dropzone.addEventListener('click', () => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.pdf,.png,.jpg,.jpeg';
+            input.multiple = true;
+            input.onchange = () => handleFiles(input.files);
+            input.click();
+        });
+
+        dropzone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropzone.classList.add('hover');
+        });
+
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('hover'));
+        dropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('hover');
+            handleFiles(e.dataTransfer.files);
+        });
+
+
+        // Add animation class and smooth styles to progress bar
+        progressBar.style.transition = 'width 0.5s ease-in-out';
+        progressBar.style.height = '14px';
+        progressBar.style.borderRadius = '999px';
+        progressBar.style.background = 'linear-gradient(to right, #6366F1, #4F46E5)';
+        progressBar.style.position = 'relative';
+        progressBar.innerHTML = '<div class="spinner"></div>';
+
+        // Add spinner style
+        const style = document.createElement('style');
+        style.innerHTML = `
+    .spinner {
+        width: 14px;
+        height: 14px;
+        border: 2px solid #fff;
+        border-top: 2px solid transparent;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        position: absolute;
+        right: 5px;
+        top: 50%;
+        transform: translateY(-50%);
+    }
+    @keyframes spin {
+        from { transform: translateY(-50%) rotate(0deg); }
+        to { transform: translateY(-50%) rotate(360deg); }
+    }
+    `;
+        document.head.appendChild(style);
+
+        const updateProgress = (percent, label = '') => {
+            progressBar.style.width = percent + '%';
+            fileInfo.style.display = label ? 'block' : 'none';
+            fileInfo.innerText = label;
+            progressBar.querySelector('.spinner').style.display = percent < 100 ? 'block' : 'none';
+        };
+
+
+        async function handleFiles(files) {
+            const validFiles = Array.from(files).filter(f => f.name.match(/\.(pdf|png|jpe?g)$/i));
+            if (!validFiles.length) {
+                return alert('Please upload at least one valid file');
+            }
+
+            resultsContainer.innerHTML = '';
+            document.querySelector('.progress-wrapper').style.display = 'block';
+
+            if (mergeMode) {
+                // —— Merge 模式：一次送全部檔案
+                updateProgress(5, `📤 Submitting merge job…`);
+                const fd = new FormData();
+                validFiles.forEach(f => fd.append('files', f));
+                const modelSel = document.querySelector('input[name="modelSel"]:checked').value;  // ← 加這行
+                fd.append('model', modelSel);  // ← 加這行
+
+                const res = await fetch(`${API_BASE}/merge_and_convert`, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + localStorage.getItem('auth_token') },
+                    body: fd
+                });
+                if (res.ok) {
+                    const { markdown } = await res.json();
+                    renderResultCard('Merged Report', markdown);
+                } else {
+                    resultsContainer.appendChild(createErrorCard('Merged Report', `HTTP ${res.status}`));
+                }
+            }
+
+            else {
+                // —— 單檔逐一處理
+                for (let i = 0; i < validFiles.length; i++) {
+                    const file = validFiles[i];
+                    const idxText = `(${i + 1}/${validFiles.length})`;
+                    updateProgress(5, `📤 Submitting ${file.name} ${idxText}`);
+                    let jobId;
+                    try {
+                        jobId = await submitJob(file);
+                    } catch (e) {
+                        resultsContainer.appendChild(createErrorCard(file.name, e.message));
+                        continue;
+                    }
+                    updateProgress(20, `⏳ Processing ${file.name} ${idxText}`);
+                    let result;
+                    while ((result = await checkJob(jobId)).status === 'running') {
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                    if (result.status === 'done') {
+                        renderResultCard(file.name, result.markdown);
+                    } else {
+                        resultsContainer.appendChild(createErrorCard(file.name, result.error));
+                    }
+                }
+            }
+
+            // —— 全部完成後一併隱藏進度條 & fileInfo
+            updateProgress(100, '✅ All done!');
+            setTimeout(() => {
+                document.querySelector('.progress-wrapper').style.display = 'none';
+                fileInfo.style.display = 'none';
+            }, 1000);
+        }
+
+
+
+
+        // 1. 提交 job，得到 job_id
+        async function submitJob(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            const modelSel = document.querySelector('input[name="modelSel"]:checked').value;
+            formData.append('model', modelSel);
+            const res = await fetch(`${API_BASE}/submit_conversion`, {
+                method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + localStorage.getItem('auth_token') },
+                body: formData
+            });
+            if (res.ok) {
+                const { job_id } = await res.json(); // ✅ 修正重點
+                return job_id;
+            }
+            document.querySelector('.progress-wrapper').style.display = 'none';
+            fileInfo.style.display = 'none';
+            throw new Error(`Submit failed: ${res.status}`);
+        }
+
+
+        // 2. 查詢 job 狀態
+        async function checkJob(jobId) {
+            const res = await fetch(`${API_BASE}/job_status/${jobId}`, {
+                headers: { 'Authorization': 'Bearer ' + localStorage.getItem('auth_token') }
+            });
+            if (res.status === 202) return { status: 'running' };
+            if (res.status === 200) {
+                const json = await res.json();
+                return { status: 'done', markdown: json.markdown };
+            }
+            // 400,404,500 都視為失敗
+            const err = await res.json();
+            return { status: 'error', error: err.error || `HTTP ${res.status}` };
+        }
+        // async function submitJob(file) {
+        //     const fd = new FormData(); fd.append('file', file);
+        //     const res = await fetch(`${API_BASE}/submit_conversion`, {
+        //         method: 'POST', headers: { 'Authorization': 'Bearer ' + localStorage.getItem('auth_token') }, body: fd
+        //     });
+        //     if (res.status === 202) return (await res.json()).job_id;
+        //     throw new Error(`Submit failed: ${res.status}`);
+        // }
+
+        // async function checkJob(jobId) {
+        //     const res = await fetch(`${API_BASE}/job_status/${jobId}`, {
+        //         headers: { 'Authorization': 'Bearer ' + localStorage.getItem('auth_token') }
+        //     });
+        //     if (res.status === 202) return { status: 'running' };
+        //     if (res.status === 200) { const j = await res.json(); return { status: 'done', markdown: j.markdown }; }
+        //     const j = await res.json(); return { status: 'error', error: j.error || `HTTP ${res.status}` };
+        // }
+        function renderResultCard(name, md) {
+            const card = document.createElement('div'); card.style.background = 'white'; card.style.borderRadius = '1rem'; card.style.padding = '1.5rem'; card.style.marginBottom = '1rem'; card.style.boxShadow = '0 2px 8px rgba(0,0,0,0.05)';
+            const title = document.createElement('h3'); title.innerText = `📄 ${name}`; title.style.marginBottom = '0.5rem';
+            const preview = document.createElement('div'); preview.innerHTML = marked.parse(md); preview.style.marginBottom = '1rem';
+            const btn = document.createElement('button'); btn.textContent = '⬇️ Download .md'; btn.className = 'button';
+            btn.onclick = () => { const blob = new Blob([md], { type: 'text/markdown' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = name.replace(/\.[^/.]+$/, '') + '.md'; a.click(); URL.revokeObjectURL(url); };
+            card.append(title, preview, btn); resultsContainer.appendChild(card);
+        }
+
+        function createErrorCard(name, msg) {
+            const e = document.createElement('div'); e.innerHTML = `❌ Failed to convert <b>${name}</b>: ${msg}`; e.style.color = 'red'; e.style.marginBottom = '1rem'; return e;
+        }
+
+    </script>
+</body>
+
+</html>
