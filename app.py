@@ -15,6 +15,7 @@ from functools import wraps
 import threading
 import uuid
 from werkzeug.datastructures import FileStorage
+import textwrap
 
 
 # # 暫存所有 job 的狀態與結果
@@ -36,21 +37,6 @@ app.config['JSONIFY_MIMETYPE'] = "application/json;charset=utf-8"
 JWT_SECRET = os.getenv('JWT_SECRET')
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
 DEBUG_BYPASS_AUTH = os.getenv("DEBUG_BYPASS_AUTH", "false").lower() == "true"
-
-# # Load local model
-# llm_old = Llama(
-#     model_path="./models/JSL-MedMNX-7B-SFT-Q4_K_M.gguf",
-#     n_ctx=8192, n_gpu_layers=-1, use_mlock=True, use_mmap=True, verbose=True
-# )
-
-# llm_new = Llama(
-#     model_path="./mistral-7b-med-merged/mistral-7b-med-q4k.gguf",
-#     n_ctx=8192, n_gpu_layers=-1, use_mlock=True, use_mmap=True, verbose=True
-# )
-
-# print("✅ Local model loaded!")
-
-# Authentication decorator
 
 
 def require_auth(f):
@@ -81,57 +67,112 @@ llm_old = None
 llm_new = None
 
 
+def load_model(path: str, target_gpu_layers: int):
+    """
+    動態嘗試不同 GPU 層數載入模型，若 OOM 則自動 fallback。
+    """
+    # 依序嘗試 target_gpu_layers, 一半, 最後全部 CPU
+    # 縮到 2048，並開啟 8-bit KV cache
+    base_kwargs = dict(
+        model_path=path,
+        n_ctx=2048,
+        f16_kv=True,               # 讓 KV cache 8-bit
+        use_mlock=True,
+        use_mmap=True,
+        n_threads=os.cpu_count(),
+        verbose=True
+    )
+    for gpu_layers in (target_gpu_layers, target_gpu_layers // 2, 0):
+        try:
+            return Llama(**base_kwargs, n_gpu_layers=gpu_layers)
+
+        except RuntimeError:
+            print(f"⚠️ 無法在 GPU 上載入 {gpu_layers} 層，改用更低層數或 CPU... ")
+    # 最後全部跑 CPU
+    return Llama(**base_kwargs, n_gpu_layers=0)
+
+
+# 在檔案開頭先 import textwrap，並定義完整模板
+import textwrap
+
+SYSTEM_PROMPT = textwrap.dedent("""\
+You are a professional medical assistant. Given an OCR-extracted pathology report, extract **exactly** the following four sections **in this order**, using markdown headings (###). **Do not** output any other headings, sections, or narrative text:
+
+### Histologic type:
+- <short, one-line summary or "N/A">
+
+### Histologic grade:
+- <short, one-line summary or "N/A">
+
+### Primary tumor (pT):
+- <short, one-line summary or "N/A">
+
+### FINAL DIAGNOSIS:
+- <**2 to 4 summary sentences** of explanation based on histologic evidence. Provide exactly 2-4 summary sentences, each on its own line.>
+
+Begin output **immediately** with the first heading and nothing else.
+""")
+
 def run_llm(llm_name, ocr_text, sections=None):
     global llm_old, llm_new
+
+    # 動態載入或重用模型
     if llm_name == 'old':
         if llm_old is None:
-            llm_old = Llama(
-                model_path="./models/JSL-MedMNX-7B-SFT-Q4_K_M.gguf",
-                n_ctx=8192, n_gpu_layers=-1, use_mlock=True, use_mmap=True, verbose=True
+            llm_old = load_model(
+                "./models/JSL-MedMNX-7B-SFT-Q4_K_M.gguf",
+                target_gpu_layers=16
             )
         llm = llm_old
-    elif llm_name == 'new':
+    else:  # new
         if llm_new is None:
-            llm_new = Llama(
-                model_path="./mistral-7b-med-merged/mistral-7b-med-q4k.gguf",
-                n_ctx=8192, n_gpu_layers=-1, use_mlock=True, use_mmap=True, verbose=True
+            llm_new = load_model(
+                "./mistral-7b-med-merged/mistral-7b-med-q4k.gguf",
+                target_gpu_layers=16
             )
         llm = llm_new
-    prompts = {
-        "Histologic type": "### Histologic type:\n- <one-line summary or \"N/A\">",
-        "Histologic grade": "### Histologic grade:\n- <one-line summary or \"N/A\">",
-        "Primary tumor": "### Primary tumor (pT):\n- <one-line summary or \"N/A\">",
-        "FINAL DIAGNOSIS": "### FINAL DIAGNOSIS:\n- <2–4 line summary sentence or \"N/A\">"
-    }
 
+    # 根據 sections 參數動態建立 system prompt
     if sections:
-        selected = [prompts[k] for k in sections if k in prompts]
+        parts = []
+        for sec in sections:
+            if sec == "Histologic type":
+                parts.append("### Histologic type:\n- <short, one-line summary or \"N/A\">")
+            elif sec == "Histologic grade":
+                parts.append("### Histologic grade:\n- <short, one-line summary or \"N/A\">")
+            elif sec == "Primary tumor":
+                parts.append("### Primary tumor (pT):\n- <short, one-line summary or \"N/A\">")
+            elif sec == "FINAL DIAGNOSIS":
+                parts.append(
+                    "### FINAL DIAGNOSIS:\n"
+                    "- <one summary sentence or \"N/A\">\n"
+                    "- <2–4 sentences of explanation based on histologic evidence, each on its own line. Provide exactly 2–4 sentences.>"
+                )
+        system_prompt = "You are a professional medical assistant. Extract exactly the following sections in order, using markdown headings (###). Do not output any other text or headings:\n\n" \
+                        + "\n\n".join(parts) + "\n\nBegin your output immediately with the first heading and nothing else."
     else:
-        selected = prompts.values()
-
-    system_prompt = """
-        You are a professional medical assistant. Given an OCR-extracted pathology report, analyze and summarize the findings below in markdown format using heading syntax (###):\n\n### Histologic type:\n- (short summary)\n\n### Histologic grade:\n- (short summary)\n\n### Primary tumor (pT):\n- (short summary)\n\n ### FINAL DIAGNOSIS:\n- (summary line)\n- (brief 2–4 line explanation based on histologic evidence)\n\n Rules:\n- Only output the markdown (no explanations or extra tags).\nPlease begin the output with ### Histologic type:"
-    """
+        # 全模板
+        system_prompt = SYSTEM_PROMPT
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": ocr_text}
+        {"role": "system",  "content": system_prompt},
+        {"role": "user",    "content": ocr_text}
     ]
 
-    response = llm.create_chat_completion(
+    # 呼叫 LLM，不用額外 stop token，讓它跑完所有 bullet
+    res = llm.create_chat_completion(
         messages=messages,
         max_tokens=1024,
-        temperature=0.3,      # 🔵 降低隨機性，避免亂跳
-        top_p=0.9,            # 🔵 降低發散程度
-        frequency_penalty=0.5,  # 🔵 防止重複
-        presence_penalty=0.2,  # 🔵 適度鼓勵少量新資訊
-        stop=["Specimen","<|end_of_turn|>"]  # 🔵 強制遇到標題就停
+        temperature=0.2,
+        top_p=0.9,
+        frequency_penalty=0.5,
+        presence_penalty=0.1
     )
 
-    output = response['choices'][0]['message']['content'].strip()
-    if "### Histologic type:" in output:
-        output = output[output.index("### Histologic type:"):]
-    return output
+    output = res["choices"][0]["message"]["content"].strip()
+    # 確保從第一個 ### 開始
+    idx = output.find("### ")
+    return output[idx:] if idx != -1 else output
 
 
 # Conversion helper: runs OCR and LLM to produce markdown
@@ -150,62 +191,40 @@ def do_conversion(file_bytes: bytes, model: str) -> str:
 
     # Run OCR
     subprocess.run([
-        "ocrmypdf", "--force-ocr", "--sidecar", sidecar_txt, tmp_path, ocr_output_pdf
+        "ocrmypdf",
+        "--force-ocr",
+        "--image-dpi", "300",      # ← 指定一個合理的掃描解析度
+        "--sidecar", sidecar_txt,
+        tmp_path,
+        ocr_output_pdf
     ], check=True)
-
     # Read OCR text
     with open(sidecar_txt, "r", encoding="utf-8") as f:
-        ocr_text = f.read()[:8000]
+        ocr_text = f.read()[:5000]
         if model == 'old':
             markdown = run_llm('old', ocr_text)
         elif model == 'new':
             markdown = run_llm('new', ocr_text)
         elif model == 'mixed':
+            # 舊模型跑前三節
             md1 = run_llm('old', ocr_text, sections=[
                 "Histologic type", "Histologic grade", "Primary tumor"
             ])
-            md2 = run_llm('new', ocr_text, sections=["FINAL DIAGNOSIS"])
-            markdown = md1 + "\n\n" + md2
+            # 新模型只跑 FINAL DIAGNOSIS，並擷取這一段
+            md2_raw = run_llm('new', ocr_text, sections=["FINAL DIAGNOSIS"])
+            start2 = md2_raw.find("### FINAL DIAGNOSIS:")
+            if start2 != -1:
+                # 找下一個 ### (如果有)，否則取到尾
+                next_h = md2_raw.find("\n### ", start2 + 1)
+                md2 = md2_raw[start2: next_h] if next_h != -1 else md2_raw[start2:]
+            else:
+                md2 = md2_raw
+            # 合併時去除多餘空行
+            markdown = md1.rstrip() + "\n\n" + md2.lstrip()
         else:
             raise ValueError("Invalid model option")
 
-    # # System prompt with strict template instructions
-    #     system_prompt = """
-    #     You are a professional medical assistant. I will provide you with the raw OCR text of a pathology report.
-    #     Your TASK is to extract exactly four pieces of information and output ONLY the following Markdown template, with no extra text or explanation:
-
-    #     ### Histologic type:
-    #     - <one-line summary or "N/A">
-
-    #     ### Histologic grade:
-    #     - <one-line summary or "N/A">
-
-    #     ### Primary tumor (pT):
-    #     - <one-line summary or "N/A">
-
-    #     ### FINAL DIAGNOSIS:
-    #     - <summary sentence or "N/A">
-    #     - <2–4 line explanation or "N/A">
-
-    #     RULES:
-    #     1. Follow the above header order exactly, with no additional blank lines or sections.
-    #     2. If a field cannot be determined, respond with "N/A".
-    #     3. Do not include any additional headings, comments, system messages, or footnotes.
-    #     4. Your output MUST begin immediately with "### Histologic type:" as the first line. Do not write anything before it.
-    #     """
-
-    # messages = [
-    #     {"role": "system", "content": system_prompt},
-    #     {"role": "user", "content": ocr_text}
-    # ]
-
-    # # Call LLM
-    # response = llm.create_chat_completion(
-    #     messages=messages,
-    #     max_tokens=1024,
-    #     stop=["<|end_of_turn|>"]
-    # )
-    # markdown = response['choices'][0]['message']['content'].strip()
+   
 
     # 強制清除：只留從 ### Histologic type: 開始的部分
     start = markdown.find("### Histologic type:")
@@ -252,7 +271,7 @@ def submit_conversion():
 
     return jsonify({'job_id': job_id}), 202
 
-# Route: check job status and result
+
 
 
 @app.route('/job_status/<job_id>', methods=['GET'])
@@ -268,7 +287,6 @@ def job_status(job_id):
     # error case
     return jsonify({'status': 'error', 'error': job['result']}), 500
 
-# Serve frontend static files
 
 
 @app.route('/')
@@ -339,11 +357,19 @@ def merge_and_convert():
             elif model_choice == 'new':
                 markdown = run_llm('new', ocr_text)
             elif model_choice == 'mixed':
+                # 舊模型取前三節
                 md1 = run_llm('old', ocr_text, sections=[
                     "Histologic type", "Histologic grade", "Primary tumor"
                 ])
-                md2 = run_llm('new', ocr_text, sections=["FINAL DIAGNOSIS"])
-                markdown = md1 + "\n\n" + md2
+                # 新模型只跑 FINAL DIAGNOSIS，並截取該段
+                md2_raw = run_llm('new', ocr_text, sections=["FINAL DIAGNOSIS"])
+                start2 = md2_raw.find("### FINAL DIAGNOSIS:")
+                if start2 != -1:
+                    next_h = md2_raw.find("\n### ", start2 + 1)
+                    md2 = md2_raw[start2: next_h] if next_h != -1 else md2_raw[start2:]
+                else:
+                    md2 = md2_raw
+                markdown = md1.rstrip() + "\n\n" + md2.lstrip()
             else:
                 raise ValueError("Invalid model option")
 
@@ -352,58 +378,9 @@ def merge_and_convert():
                 markdown = markdown[start:]
             markdown = markdown[:10000]  # 最多保護到1萬字
 
-        #     system_prompt = """
-        #     You are a professional medical assistant. I will provide you with the raw OCR text of a pathology report.
-        #     Your TASK is to extract exactly four pieces of information and output ONLY the following Markdown template, with no extra text or explanation:
 
-        #     ### Histologic type:
-        #     - <one-line summary or "N/A">
-
-        #     ### Histologic grade:
-        #     - <one-line summary or "N/A">
-
-        #     ### Primary tumor (pT):
-        #     - <one-line summary or "N/A">
-
-        #     ### FINAL DIAGNOSIS:
-        #     - <summary sentence or "N/A">
-        #     - <2–4 line explanation or "N/A">
-
-        #     RULES:
-        #     1. Follow the above header order exactly, with no additional blank lines or sections.
-        #     2. If a field cannot be determined, respond with "N/A".
-        #     3. Do not include any additional headings, comments, system messages, or footnotes.
-        #     4. Your output MUST begin immediately with "### Histologic type:" as the first line. Do not write anything before it.
-        #     """
-
-        # messages = [
-        #     {"role": "system", "content": system_prompt},
-        #     {"role": "user", "content": ocr_text}
-        # ]
-
-        # response = llm.create_chat_completion(
-        #     messages=messages,
-        #     max_tokens=1024,
-        #     stop=["<|end_of_turn|>"]
-        # )
-        # markdown = response["choices"][0]["message"]["content"].strip()
-
-        # ===== post-process: 去掉任何 ### Histologic type: 之前的內容 =====
 
         return jsonify({'markdown': markdown})
-
-        # filenames = [file.filename for file in uploaded_files]
-        # files_info = []
-        # for file in uploaded_files:
-        #     filetype = file.content_type or "application/octet-stream"
-        #     file.stream.seek(0)
-        #     encoded = base64.b64encode(file.read()).decode('utf-8')
-        #     url = f"data:{filetype};base64,{encoded}"
-        #     files_info.append(
-        #         {"name": file.filename, "type": filetype, "url": url})
-        #     file.stream.seek(0)
-
-        # return jsonify({'markdown': markdown, 'filenames': filenames, 'files': files_info})
 
     except Exception as e:
         import traceback
@@ -416,6 +393,25 @@ def merge_and_convert():
             except:
                 pass
 
+import tempfile
+import time
+
+def cleanup_temp_files(older_than_secs=3600):
+
+    tmpdir = tempfile.gettempdir()
+    now = time.time()
+    for name in os.listdir(tmpdir):
+        path = os.path.join(tmpdir, name)
+        try:
+            if not os.path.isfile(path):
+                continue
+            if not (name.endswith('.pdf') or name.endswith('.txt') or name.endswith('_ocr.pdf')):
+                continue
+            if os.path.getmtime(path) < now - older_than_secs:
+                os.remove(path)
+        except Exception:
+            pass
 
 if __name__ == '__main__':
+    cleanup_temp_files(older_than_secs=600)  
     app.run(debug=True, host='0.0.0.0', port=85)

@@ -103,7 +103,7 @@
     <div class="container">
         <div class="header">
             <h1>Medical Report Simplifier</h1>
-            <p>Upload pathology reports and get structured summaries instantly</p>
+            <p>快速分析並精簡你的病例報告</p>
         </div>
 
         <div style="margin:1rem 0">
@@ -113,7 +113,7 @@
         </div>
 
         <div class="dropzone" id="dropzone">
-            <p>Click or drop PDFs here to upload and convert</p>
+            <p>上傳檔案</p>
         </div>
         <div class="progress-wrapper">
             <div class="progress-bar" id="progressBar"></div>
@@ -143,7 +143,7 @@
 
         mergeToggle.innerHTML = `
   <input type="checkbox" id="mergeModeToggle" />
-  <span>Merge all uploads into a single report</span>
+  <span>合併所有上傳檔案當作同一個病例</span>
 `;
 
         document.querySelector('.container').insertBefore(mergeToggle, document.getElementById('dropzone'));
@@ -280,7 +280,11 @@
             }, 1000);
         }
 
-
+        function truncateName(name, maxLen = 15) {
+            return name.length > maxLen
+                ? name.slice(0, maxLen) + '…'
+                : name;
+        }
 
 
         // 1. 提交 job，得到 job_id
@@ -337,7 +341,10 @@
         // }
         function renderResultCard(name, md) {
             const card = document.createElement('div'); card.style.background = 'white'; card.style.borderRadius = '1rem'; card.style.padding = '1.5rem'; card.style.marginBottom = '1rem'; card.style.boxShadow = '0 2px 8px rgba(0,0,0,0.05)';
-            const title = document.createElement('h3'); title.innerText = `📄 ${name}`; title.style.marginBottom = '0.5rem';
+            const displayName = truncateName(name, 15);
+            const title = document.createElement('h3');
+            title.innerText = `📄 ${displayName}`;
+            title.style.marginBottom = '0.5rem';
             const preview = document.createElement('div'); preview.innerHTML = marked.parse(md); preview.style.marginBottom = '1rem';
             const btn = document.createElement('button'); btn.textContent = '⬇️ Download .md'; btn.className = 'button';
             btn.onclick = () => { const blob = new Blob([md], { type: 'text/markdown' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = name.replace(/\.[^/.]+$/, '') + '.md'; a.click(); URL.revokeObjectURL(url); };
